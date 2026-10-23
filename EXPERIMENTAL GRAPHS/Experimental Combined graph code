@@ -1,0 +1,292 @@
+from pathlib import Path
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+cwd = Path.cwd()
+home = Path.home()
+
+def find_csv(filename, kind):
+    candidates = set()
+
+    roots = [
+        cwd,
+        cwd.parent,
+        home,
+        home / "ComparisonGraphs_Hackathon",
+        home / "data",
+    ]
+
+    for root in roots:
+        if not root.exists():
+            continue
+
+        # Search for matching files, including processed subfolders
+        try:
+            candidates.update(p.resolve() for p in root.rglob(filename)
+                              if p.is_file())
+        except (PermissionError, OSError):
+            pass
+
+    valid = []
+
+    for path in candidates:
+        try:
+            df = pd.read_csv(path)
+            if kind == "amr":
+                required = {
+                    "date", "bacteria", "resistance_type", "resistance"
+                }
+                if not required.issubset(df.columns):
+                    continue
+
+                species_count = df["bacteria"].nunique()
+                valid_values = pd.to_numeric(
+                    df["resistance"], errors="coerce"
+                ).notna().sum()
+
+                # Prefer all six species and the most usable observations
+                score = (species_count, valid_values, len(df))
+
+            else:
+                if not {"date", "total_did"}.issubset(df.columns):
+                    continue
+
+                valid_values = pd.to_numeric(
+                    df["total_did"], errors="coerce"
+                ).notna().sum()
+
+                score = (valid_values, len(df))
+
+            valid.append((score, path))
+
+        except (OSError, ValueError, pd.errors.ParserError):
+            continue
+
+    if not valid:
+        raise FileNotFoundError(
+            f"Could not find a usable {filename}. "
+            f"Current directory: {cwd}"
+        )
+
+    valid.sort(key=lambda item: item[0], reverse=True)
+    chosen = valid[0][1]
+
+    print(f"Using {kind} data: {chosen}")
+    return chosen
+
+
+consumption_path = find_csv(
+    "ukhsa_consumption_clean.csv", "consumption"
+)
+amr_path = find_csv("amr_all_bacteria.csv", "amr")
+
+consumption = pd.read_csv(consumption_path, parse_dates=["date"])
+amr = pd.read_csv(amr_path, parse_dates=["date"])
+
+amr["bacteria"] = (
+    amr["bacteria"].astype("string").str.replace("-", "_", regex=False)
+)
+
+amr["resistance"] = pd.to_numeric(
+    amr["resistance"], errors="coerce"
+)
+
+consumption["total_did"] = pd.to_numeric(
+    consumption["total_did"], errors="coerce"
+)
+
+# Remove empty rows introduced by the earlier reindexing step
+amr = amr.dropna(
+    subset=["date", "bacteria", "resistance_type", "resistance"]
+).copy()
+
+amr["month"] = amr["date"].dt.to_period("M")
+consumption["month"] = consumption["date"].dt.to_period("M")
+
+# Monthly England-wide antibiotic use
+consumption_monthly = (
+    consumption.groupby("month", as_index=False)
+    .agg(total_did=("total_did", "mean"))
+)
+
+# creating the average resistance
+
+amr_average = (
+    amr.groupby(
+        ["month", "bacteria", "resistance_type"],
+        as_index=False
+    )
+    .agg(
+        resistance=("resistance", "mean"),
+        regions_reporting=("region", "nunique")
+    )
+)
+
+# Verify that the expected species are available
+expected_species = {
+    "E_coli", "E_faecalis", "E_faecium",
+    "K_pneumoniae", "P_aeruginosa", "S_pneumoniae"
+}
+
+available_species = set(amr_average["bacteria"].unique())
+missing = expected_species - available_species
+
+if missing:
+    raise ValueError(
+        "The selected AMR file is missing these species: "
+        + ", ".join(sorted(missing))
+        + ". Restore the complete six-species AMR dataset."
+    )
+
+print("\nValid AMR observations:", len(amr))
+print("Species available:", len(available_species))
+
+# graph settings
+
+names = {
+    "E_coli": "E. coli",
+    "E_faecalis": "E. faecalis",
+    "E_faecium": "E. faecium",
+    "K_pneumoniae": "K. pneumoniae",
+    "P_aeruginosa": "P. aeruginosa",
+    "S_pneumoniae": "S. pneumoniae",
+}
+
+BLUE = "#2878B5"
+ORANGE = "#E68A00"
+
+output_dir = cwd / "coloured_graphs"
+output_dir.mkdir(parents=True, exist_ok=True)
+
+# prepare each species
+
+plot_data_by_species = {}
+
+for bacterium in sorted(expected_species):
+    species_data = amr_average[
+        amr_average["bacteria"] == bacterium
+    ].copy()
+
+    # Select the resistance type with the most valid monthly averages
+    counts = (
+        species_data.groupby("resistance_type")["resistance"]
+        .count()
+        .sort_values(ascending=False)
+    )
+
+    if counts.empty or counts.iloc[0] == 0:
+        print("No valid resistance measurements for", bacterium)
+        continue
+
+    resistance_type = counts.index[0]
+
+    resistance_data = species_data[
+        species_data["resistance_type"] == resistance_type
+    ]
+
+    # Compare the same calendar months
+    plot_data = resistance_data.merge(
+        consumption_monthly,
+        on="month",
+        how="inner"
+    ).sort_values("month")
+
+    plot_data = plot_data.dropna(
+        subset=["resistance", "total_did"]
+    )
+
+    if plot_data.empty:
+        print("No overlapping months for", bacterium)
+        continue
+
+    plot_data_by_species[bacterium] = (
+        plot_data, resistance_type
+    )
+
+# Singular Graph per species
+
+for bacterium, (data, resistance_type) in plot_data_by_species.items():
+    dates = data["month"].dt.to_timestamp()
+    name = names.get(bacterium, bacterium)
+
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+
+    # Blue line: total antibiotic usage
+    ax1.plot(
+        dates,
+        data["total_did"],
+        color=BLUE,
+        linewidth=2.5,
+        label="Total antibiotic use"
+    )
+
+    ax1.set_xlabel("Year")
+    ax1.set_ylabel("Antibiotic use (DID)", color=BLUE)
+    ax1.tick_params(axis="y", labelcolor=BLUE)
+    ax1.grid(True, linestyle=":", alpha=0.35)
+
+    # Orange line: average resistance across regions
+    ax2 = ax1.twinx()
+
+    ax2.plot(
+        dates,
+        data["resistance"],
+        color=ORANGE,
+        linewidth=2.5,
+        linestyle="--",
+        label="Average resistance (%)"
+    )
+
+    ax2.set_ylabel("Resistant isolates (%)", color=ORANGE)
+    ax2.tick_params(axis="y", labelcolor=ORANGE)
+
+    ax1.set_title(
+        f"{name}: {resistance_type} Resistance Compared with "
+        "Antibiotic Use",
+        fontsize=13,
+        fontweight="bold",
+        pad=14
+    )
+
+    ax1.xaxis.set_major_locator(mdates.YearLocator())
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+
+    ax1.legend(
+        lines1 + lines2,
+        labels1 + labels2,
+        loc="best"
+    )
+
+    fig.tight_layout()
+
+    output_file = output_dir / f"{bacterium}_usage_vs_resistance.png"
+
+    fig.savefig(output_file, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    print(
+        f"Saved {name}: {resistance_type}, "
+        f"{len(data)} overlapping months"
+    )
+
+fig.suptitle(
+    "Antibiotic Use Compared with Average Antimicrobial Resistance",
+    fontsize=16,
+    fontweight="bold"
+)
+fig.supxlabel("Year")
+fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+combined_path = output_dir / "all_species_usage_vs_resistance.png"
+fig.savefig(combined_path, dpi=300, bbox_inches="tight")
+plt.close(fig)
+
+print("\nFinished. All graphs saved in:")
+print(output_dir.resolve())
+print("Combined graph:", combined_path.name)
